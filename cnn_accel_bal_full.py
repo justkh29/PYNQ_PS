@@ -7,7 +7,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import socket
 import threading
-
+import sys
 # ==============================================================================
 # YOLO Post-Processing Constants 
 # ==============================================================================
@@ -26,7 +26,7 @@ LEAKY_RELU_SHIFT = 7    # Example value
 # ==============================================================================
 # Utility Functions
 # ==============================================================================
-import sys
+
 
 class Logger(object):
     def __init__(self, filename="inference_log.txt"):
@@ -132,17 +132,17 @@ def preprocess_quantized(img, size=640):
     return img_int8
 
 def slice_feature_map(src_buf, H, W, total_channels):
-    tensor_3d = np.array(src_buf).reshape((H, W, total_channels))
+    tensor_3d = src_buf.reshape((H, W, total_channels))
     half_ch = total_channels // 2
     part1 = tensor_3d[:, :, :half_ch]
     part2 = tensor_3d[:, :, half_ch:]
-    return part1.flatten(), part2.flatten()
+    return part1.ravel(), part2.ravel()
 
 def concat_feature_maps(buf1, buf2, H, W, ch1, ch2):
-    t1 = np.array(buf1).reshape((H, W, ch1))
-    t2 = np.array(buf2).reshape((H, W, ch2))
+    t1 = buf1.reshape((H, W, ch1))
+    t2 = buf2.reshape((H, W, ch2))
     t_concat = np.concatenate((t1, t2), axis=2)
-    return t_concat.flatten()
+    return t_concat.ravel() # Also changed flatten() to ravel()
 
 def resize_nearest_cpu(input_flat, H, W, C, scale=2):
     """
@@ -161,7 +161,7 @@ def resize_nearest_cpu(input_flat, H, W, C, scale=2):
     print(f"    [CPU] Resize Done in {(cpu_end_time - cpu_start_time):.6f} sec")
 
     # 3. Flatten and return
-    return out.flatten()
+    return out.ravel()
 def print_tensor_stats(name, tensor):
     """
     Print useful debug statistics for a tensor.
@@ -211,24 +211,22 @@ def cpu_conv2d_layer(
     print(f"    [CPU] Running NumPy Conv2D (Cin={Cin}, Cout={Cout}, K={K}x{K})...")
     cpu_start_time = time.perf_counter()
 
-    # =========================================================
+# =========================================================
     # OPTIMIZATION: 1x1 Convolution Fast-Path
     # =========================================================
     if K == 1 and stride == 1:
-        # For 1x1 convs, no sliding window or padding is needed.
-        # Just reshape Image to (Pixels, Cin) and Weights to (Cin, Cout)
-        X_col = input_flat.reshape(H * W, Cin).astype(np.int32)
-        W_reshaped = weights.reshape(Cout, Cin).T.astype(np.int32)
+        # Cast to float32 to trigger optimized OpenBLAS/NEON matmul
+        X_col = input_flat.reshape(H * W, Cin).astype(np.float32)
+        W_reshaped = weights.reshape(Cout, Cin).T.astype(np.float32)
         
-        # Matrix Multiply
-        Y_col = np.dot(X_col, W_reshaped)
+        # Matrix Multiply and instantly cast back to int32
+        Y_col = np.dot(X_col, W_reshaped).astype(np.int32)
     
     # =========================================================
     # Standard 3x3 (or stride 2) path using im2col
     # =========================================================
     else:
         x = input_flat.reshape(H, W, Cin) 
-
         if pad > 0:
             x_pad = np.pad(x, ((pad, pad), (pad, pad), (0, 0)), mode='constant', constant_values=0)
         else:
@@ -237,10 +235,11 @@ def cpu_conv2d_layer(
         windows = sliding_window_view(x_pad, (K, K, Cin))
         windows = windows[::stride, ::stride, 0, :, :, :]
         
-        X_col = windows.reshape(out_h * out_w, -1).astype(np.int32)
-        W_reshaped = weights.reshape(Cout, Cin, K, K).transpose(0, 2, 3, 1).reshape(Cout, -1).T.astype(np.int32)
+        # Cast to float32 here as well
+        X_col = windows.reshape(out_h * out_w, -1).astype(np.float32)
+        W_reshaped = weights.reshape(Cout, Cin, K, K).transpose(0, 2, 3, 1).reshape(Cout, -1).T.astype(np.float32)
 
-        Y_col = np.dot(X_col, W_reshaped)
+        Y_col = np.dot(X_col, W_reshaped).astype(np.int32)
 
     # =========================================================
     # Post-Processing (In-Place)
@@ -289,7 +288,7 @@ def maxpool_2d_cpu(input_flat, H, W, C, K=5, stride=1, pad=2):
 
     cpu_end_time = time.perf_counter()
     print(f"    [CPU] MaxPool Done in {(cpu_end_time - cpu_start_time):.6f} sec")
-    return out.flatten()
+    return out.ravel()
 
 
 # ==============================================================================
@@ -445,7 +444,6 @@ class YOLOv8Engine:
             self.cnn_ip.write(self.REG_BIAS_BASE + (n * 4), word)
 
     def _config_cnn_layer(self, _type, w, h, cin, cout, k, stride, pad, has_res, requant, bias_shift):
-        import struct
         packed_bytes = struct.pack('<BxHHHHBBBBBB', 
             _type, w, h, cin, cout, k, stride, pad, has_res, requant, bias_shift
         )
@@ -564,31 +562,19 @@ class YOLOv8Engine:
             self.dma_weights.sendchannel.wait()
             if has_residual: self.dma_residual.sendchannel.wait()
 
-            timeout = 10000
-            while timeout > 0:
-                ctrl = self.cnn_ip.read(self.REG_AP_CTRL)
-                if (ctrl >> 1) & 0x1: break
-                timeout -= 1
-                time.sleep(0.001)
-
-            if timeout == 0: raise RuntimeError("Accelerator timeout!")
 
             self.dma_pixels.recvchannel.wait()
             hw_end_time = time.perf_counter()
 
             self.cma_out_pixels.invalidate()
-            raw_output = np.copy(self.cma_out_pixels[:out_size])
-
             # --- UNPACKING ---
             unpack_start = time.perf_counter()
             if mode == 0:
-                chunk_output = self._unpack_winograd_output(raw_output, out_h, out_w, current_cout)
+                final_output[:, :, cout_start:cout_start + current_cout] = self._unpack_winograd_output(self.cma_out_pixels[:out_size], out_h, out_w, current_cout)
             else:
-                chunk_output = self._unpack_systolic_output(raw_output, out_h, out_w, current_cout)
+                final_output[:, :, cout_start:cout_start + current_cout] = self._unpack_systolic_output(self.cma_out_pixels[:out_size], out_h, out_w, current_cout)
             unpack_end = time.perf_counter()
 
-            final_output[:, :, cout_start:cout_start + current_cout] = chunk_output
-            
             print(f"Chunk {cout_start}-{cout_start + current_cout - 1} "
                   f"HW Time: {(hw_end_time - hw_start_time):.6f} sec | "
                   f"Unpack Time: {(unpack_end - unpack_start):.6f} sec")
