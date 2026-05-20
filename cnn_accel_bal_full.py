@@ -1,6 +1,7 @@
 import numpy as np
 import time
 import cv2
+from pynq import Timer
 import struct
 from pynq import Overlay, allocate
 from numpy.lib.stride_tricks import sliding_window_view
@@ -537,7 +538,6 @@ class YOLOv8Engine:
                     residual_chunk = self._pack_winograd_residual(res_slice, current_cout)
                 else:
                     residual_chunk = self._pack_systolic_residual(res_slice, current_cout)
-                
                 self.cma_in_residual[:len(residual_chunk)] = residual_chunk
 
             self.cma_in_pixels.flush()
@@ -549,7 +549,10 @@ class YOLOv8Engine:
             )
             self._write_bias(bias_chunk)
 
-            hw_start_time = time.perf_counter()
+            # ========== TIMING WITH pynq.lib.Timer ==========
+            # Timer for PS->PL transfer (sends)
+            t_send = Timer()
+            t_send.start()
 
             self.cnn_ip.write(self.REG_START_ACCEL, 1)
             self.cnn_ip.write(self.REG_AP_CTRL, 1)
@@ -564,6 +567,13 @@ class YOLOv8Engine:
             self.dma_weights.sendchannel.wait()
             if has_residual: self.dma_residual.sendchannel.wait()
 
+            t_send.stop()
+            ps_to_pl_us = t_send.elapsed
+
+            # Timer for PL compute (from end of sends to accelerator done)
+            t_pl = Timer()
+            t_pl.start()
+
             timeout = 10000
             while timeout > 0:
                 ctrl = self.cnn_ip.read(self.REG_AP_CTRL)
@@ -573,8 +583,19 @@ class YOLOv8Engine:
 
             if timeout == 0: raise RuntimeError("Accelerator timeout!")
 
+            t_pl.stop()
+            pl_compute_us = t_pl.elapsed
+
+            # Timer for PL->PS transfer (receive)
+            t_recv = Timer()
+            t_recv.start()
+
             self.dma_pixels.recvchannel.wait()
-            hw_end_time = time.perf_counter()
+
+            t_recv.stop()
+            pl_to_ps_us = t_recv.elapsed
+
+            # ========== End of timing ==========
 
             self.cma_out_pixels.invalidate()
             raw_output = np.copy(self.cma_out_pixels[:out_size])
@@ -588,10 +609,12 @@ class YOLOv8Engine:
             unpack_end = time.perf_counter()
 
             final_output[:, :, cout_start:cout_start + current_cout] = chunk_output
-            
-            print(f"Chunk {cout_start}-{cout_start + current_cout - 1} "
-                  f"HW Time: {(hw_end_time - hw_start_time):.6f} sec | "
-                  f"Unpack Time: {(unpack_end - unpack_start):.6f} sec")
+
+            print(f"Chunk {cout_start}-{cout_start + current_cout - 1}:")
+            print(f"  PS->PL transfer : {ps_to_pl_us:.3f} µs ({ps_to_pl_us/1000:.3f} ms)")
+            print(f"  PL compute      : {pl_compute_us:.3f} µs ({pl_compute_us/1000:.3f} ms)")
+            print(f"  PL->PS transfer : {pl_to_ps_us:.3f} µs ({pl_to_ps_us/1000:.3f} ms)")
+            print(f"  Unpack Time     : {(unpack_end - unpack_start)*1000:.3f} ms")
 
         layer_end_time = time.perf_counter()
         print("\n=================================================")
@@ -1313,7 +1336,7 @@ if __name__ == "__main__":
             "delete_tensors": [
                 "blob.20"
             ],
-            "device": "cpu",
+            "device": "fpga",
             "bias_shift": 9
         },
         {
@@ -1427,7 +1450,7 @@ if __name__ == "__main__":
             "K": 1,
             "stride": 1,
             "requant": 10,
-            "device": "cpu",
+            "device": "fpga",
             "delete_tensors": [
                 "blob.32"
             ],
@@ -1472,7 +1495,7 @@ if __name__ == "__main__":
             "K": 1,
             "stride": 1,
             "requant": 9,
-            "device": "cpu",
+            "device": "fpga",
             "delete_tensors": [
                 "blob.36"
             ],
@@ -1861,7 +1884,7 @@ if __name__ == "__main__":
             "delete_tensors": [
                 "blob.60"
             ],
-            "device": "cpu",
+            "device": "fpga",
             "bias_shift": 7
         },
         {
@@ -1940,7 +1963,7 @@ if __name__ == "__main__":
             "delete_tensors": [
                 "blob.64"
             ],
-            "device": "cpu",
+            "device": "fpga",
             "bias_shift": 8
         },
         {
@@ -1989,7 +2012,7 @@ if __name__ == "__main__":
             "requant": 9,
             "apply_activation": False,
             "is_output": True,
-            "device": "cpu",
+            "device": "fpga",
             "bias_shift": 5
         },
         {
