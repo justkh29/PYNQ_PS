@@ -383,61 +383,6 @@ class YOLOv8Engine:
         # Transpose to [sys_tiles, cb_blocks, 16_pixels, 16_channels]
         return res_4d.transpose(0, 2, 1, 3).flatten()
 
-    def _unpack_winograd_output(self, flat_buffer, out_h, out_w, Cout):
-        tiles_x = max(1, out_w // 2)
-        tiles_y = max(1, out_h // 2)
-        packets_per_tile = (Cout + 3) // 4
-        
-        # 1 packet = 16 bytes = 4 channels x 2 height x 2 width
-        expected_elements = tiles_y * tiles_x * packets_per_tile * 16
-        
-        # 1. Reshape the 1D buffer into its structural components
-        # Layout: (tiles_y, tiles_x, packets_per_tile, 4_channels, 2_y, 2_x)
-        arr = flat_buffer[:expected_elements].reshape(
-            tiles_y, tiles_x, packets_per_tile, 4, 2, 2
-        )
-        
-        # 2. Transpose to group spatial dimensions and channel dimensions
-        # New layout: (tiles_y, 2_y, tiles_x, 2_x, packets_per_tile, 4_channels)
-        arr = arr.transpose(0, 4, 1, 5, 2, 3)
-        
-        # 3. Reshape into standard 3D image format (padded)
-        arr = arr.reshape(tiles_y * 2, tiles_x * 2, packets_per_tile * 4)
-        
-        # 4. Slice away the padding to return exactly (out_h, out_w, Cout)
-        # We use .copy() to force contiguous memory for the output
-        return arr[:out_h, :out_w, :Cout].copy()
-
-    def _unpack_systolic_output(self, flat_buffer, out_h, out_w, current_cout):
-        sys_tiles = (out_w * out_h + 15) // 16
-        if sys_tiles == 0: sys_tiles = 1
-        cout_blocks = (current_cout + 15) // 16
-        
-        expected_elements = sys_tiles * 16 * cout_blocks * 16
-        
-        # 1. Reshape based on memory layout written by the HLS DMA
-        # Layout corresponds to: (sys_tiles, cout_blocks, 16_pixels_reversed, 16_channels)
-        arr = flat_buffer[:expected_elements].reshape(
-            sys_tiles, cout_blocks, 16, 16
-        )
-        
-        # 2. Fix the reversed pixel logic from the C++ hardware
-        # This handles the 'r = 15 - (rem % 16)' logic without a for-loop!
-        arr = arr[:, :, ::-1, :]
-        
-        # 3. Transpose to put spatial blocks together and channel blocks together
-        # New layout: (sys_tiles, 16_pixels, cout_blocks, 16_channels)
-        arr = arr.transpose(0, 2, 1, 3)
-        
-        # 4. Flatten the spatial axis and flatten the channel axis
-        arr = arr.reshape(sys_tiles * 16, cout_blocks * 16)
-        
-        # 5. Slice away spatial and channel padding
-        arr = arr[:out_h * out_w, :current_cout]
-        
-        # 6. Reshape to final 3D format (H, W, C)
-        return arr.reshape(out_h, out_w, current_cout).copy()
-
     # --------------------------------------------------------------------------
     # CONFIGURATION
     # --------------------------------------------------------------------------
@@ -481,38 +426,28 @@ class YOLOv8Engine:
         elif K == 3 and stride == 2: mode = 1        
         else: mode = 2                               
 
-        if stride == 2:
-            out_w = (W + stride - 1) // stride
-            out_h = (H + stride - 1) // stride
-        else:
-            out_w = W
-            out_h = H
-
+        out_w = (W + stride - 1) // stride if stride == 2 else W
+        out_h = (H + stride - 1) // stride if stride == 2 else H
         pad = 1 if K == 3 else 0
 
+        # Phân mảnh Tiling Cout tối đa dựa trên phần cứng (bội số của 16)
         max_bram_addr = 8096
-        if mode == 0:
-            max_cout_step = max_bram_addr // Cin
-        else:
-            k_max = 9 if mode == 1 else 1
-            max_cout_blocks = max_bram_addr // (k_max * Cin)
-            max_cout_step = max_cout_blocks * 16
-
-        max_cout_step = (max_cout_step // 16) * 16
-        if max_cout_step == 0: max_cout_step = 16
+        max_cout_step = max_bram_addr // Cin if mode == 0 else (max_bram_addr // (9 * Cin)) * 16
+        max_cout_step = max(16, (max_cout_step // 16) * 16)
         cout_step = min(Cout, max_cout_step)
 
-        print(f"Tiling Cout = {cout_step} / {Cout}")
-
+        # KHỞI TẠO MẢNG ĐẦU RA TUYẾN TÍNH CHUẨN HWC (Không cần biến đổi phụ)
         final_output = np.zeros((out_h, out_w, Cout), dtype=np.int8)
+        
+        # Đảm bảo mảng đầu vào phẳng theo đúng thứ tự tuyến tính không đổi HWC
         input_flat = input_fmap.flatten()
-        in_size = W * H * Cin
+        in_size = input_flat.size
 
         for cout_start in range(0, Cout, cout_step):
             current_cout = min(cout_step, Cout - cout_start)
             print(f"\nProcessing Cout chunk {cout_start} -> {cout_start + current_cout - 1}")
 
-            # --- WEIGHT SLICING MATCHING C++ ARRAY ---
+            # Trọng số vẫn được tổ chức tương ứng với lõi tính toán (Không đổi)
             if mode == 0:
                 w_4d = weights.reshape((Cin, Cout, 4, 4))
                 weights_chunk = w_4d[:, cout_start : cout_start + current_cout, :, :].flatten()
@@ -525,30 +460,21 @@ class YOLOv8Engine:
 
             bias_chunk = bias[cout_start:cout_start + current_cout]
 
-            # --- OUTPUT SIZE LOGIC ---
-            if mode == 0:
-                tiles_x = max(1, out_w // 2)
-                tiles_y = max(1, out_h // 2)
-                packets_per_tile = (current_cout + 3) // 4
-                out_size = tiles_x * tiles_y * packets_per_tile * 16
-            else:
-                sys_tiles = (out_w * out_h + 15) // 16
-                if sys_tiles == 0: sys_tiles = 1
-                cout_blocks = (current_cout + 15) // 16
-                out_size = sys_tiles * 16 * cout_blocks * 16
+            # KÍCH THƯỚC ĐẦU RA KHỚP HOÀN TOÀN VỚI MẢNG TUYẾN TÍNH HWC (Có tính toán phần padding lên bội của 16 của PL)
+            padded_current_cout = ((current_cout + 15) // 16) * 16
+            out_size = out_h * out_w * padded_current_cout
 
-            self.cma_in_pixels[:in_size] = input_flat
-            self.cma_in_weights[:len(weights_chunk)] = weights_chunk
+            # Sao chép trực tiếp không cần Pack dữ liệu
+            np.copyto(self.cma_in_pixels[:in_size], input_flat)
+            np.copyto(self.cma_in_weights[:len(weights_chunk)], weights_chunk)
 
-            # --- RESIDUAL PACKING MATCHING C++ ARRAY ---
             if has_residual:
+                # Dữ liệu Residual truyền vào chính là mảng HWC phẳng tuyến tính trích xuất từ phân đoạn kênh tương ứng
                 residual_3d = residual_fmap.reshape(out_h, out_w, Cout)
                 res_slice = residual_3d[:, :, cout_start:cout_start + current_cout]
-                if mode == 0:
-                    residual_chunk = self._pack_winograd_residual(res_slice, current_cout)
-                else:
-                    residual_chunk = self._pack_systolic_residual(res_slice, current_cout)
-                self.cma_in_residual[:len(residual_chunk)] = residual_chunk
+                
+                # Bản thân phần cứng PL sẽ tự xử lý Unpack luồng này, Host chỉ việc flatten đưa đi thẳng
+                np.copyto(self.cma_in_residual[:res_slice.size], res_slice.flatten())
 
             self.cma_in_pixels.flush()
             self.cma_in_weights.flush()
@@ -559,77 +485,44 @@ class YOLOv8Engine:
             )
             self._write_bias(bias_chunk)
 
-            # ========== TIMING WITH pynq.lib.Timer ==========
-            # Timer for PS->PL transfer (sends)
-            t_send = Timer()
-            t_send.start()
-
+            # --- Kích hoạt Hệ thống Không đồng bộ thông qua DMA ---
             self.cnn_ip.write(self.REG_START_ACCEL, 1)
             self.cnn_ip.write(self.REG_AP_CTRL, 1)
 
-            self.dma_pixels.recvchannel.transfer(self.cma_out_pixels[:out_size])
-            self.dma_pixels.sendchannel.transfer(self.cma_in_pixels[:in_size])
-            self.dma_weights.sendchannel.transfer(self.cma_in_weights[:len(weights_chunk)])
+            self.dma_pixels.sendchannel.transfer(self.cma_in_pixels[:in_size], wait=False)
+            self.dma_weights.sendchannel.transfer(self.cma_in_weights[:len(weights_chunk)], wait=False)
             if has_residual:
-                self.dma_residual.sendchannel.transfer(self.cma_in_residual[:len(residual_chunk)])
+                self.dma_residual.sendchannel.transfer(self.cma_in_residual[:res_slice.size], wait=False)
+
+            self.dma_pixels.recvchannel.transfer(self.cma_out_pixels[:out_size], wait=False)
 
             self.dma_pixels.sendchannel.wait()
             self.dma_weights.sendchannel.wait()
             if has_residual: self.dma_residual.sendchannel.wait()
 
-            t_send.stop()
-            ps_to_pl_us = t_send.elapsed
-
-            # Timer for PL compute (from end of sends to accelerator done)
-            t_pl = Timer()
-            t_pl.start()
-
+            # Chờ Accelerator tính toán xong
             timeout = 10000
             while timeout > 0:
                 ctrl = self.cnn_ip.read(self.REG_AP_CTRL)
                 if (ctrl >> 1) & 0x1: break
                 timeout -= 1
                 time.sleep(0.001)
-
             if timeout == 0: raise RuntimeError("Accelerator timeout!")
 
-            t_pl.stop()
-            pl_compute_us = t_pl.elapsed
-
-            # Timer for PL->PS transfer (receive)
-            t_recv = Timer()
-            t_recv.start()
-
             self.dma_pixels.recvchannel.wait()
-
-            t_recv.stop()
-            pl_to_ps_us = t_recv.elapsed
-
-            # ========== End of timing ==========
-
             self.cma_out_pixels.invalidate()
+
+            # --- KHÔNG CẦN UNPACK PHỨC TẠP: Dữ liệu đã là HWC tuyến tính chuẩn ---
             raw_output = np.copy(self.cma_out_pixels[:out_size])
-
-            # --- UNPACKING ---
-            unpack_start = time.perf_counter()
-            if mode == 0:
-                chunk_output = self._unpack_winograd_output(raw_output, out_h, out_w, current_cout)
-            else:
-                chunk_output = self._unpack_systolic_output(raw_output, out_h, out_w, current_cout)
-            unpack_end = time.perf_counter()
-
+            
+            # Chỉ cần giải phóng vùng đệm padding kênh (nếu kênh hiện tại không chia hết cho 16)
+            chunk_output = raw_output.reshape(out_h, out_w, padded_current_cout)[:, :, :current_cout]
+            
+            # Gán trực tiếp vào mảng đích
             final_output[:, :, cout_start:cout_start + current_cout] = chunk_output
 
-            print(f"Chunk {cout_start}-{cout_start + current_cout - 1}:")
-            print(f"  PS->PL transfer : {ps_to_pl_us:.3f} µs ({ps_to_pl_us/1000:.3f} ms)")
-            print(f"  PL compute      : {pl_compute_us:.3f} µs ({pl_compute_us/1000:.3f} ms)")
-            print(f"  PL->PS transfer : {pl_to_ps_us:.3f} µs ({pl_to_ps_us/1000:.3f} ms)")
-            print(f"  Unpack Time     : {(unpack_end - unpack_start)*1000:.3f} ms")
-
         layer_end_time = time.perf_counter()
-        print("\n=================================================")
-        print(f"Layer {layer_name} completed in {(layer_end_time - layer_start_time):.6f} sec")
-        print("=================================================")
+        print(f"Layer {layer_name} completed in {(layer_end_time - layer_start_time):.6f} sec (Zero CPU Remap Overhead)")
         return final_output.flatten()
 
     def clean_up(self):
@@ -2366,12 +2259,10 @@ if __name__ == "__main__":
             formatted_outputs = []
             
             for out, dequant_scale in zip(outputs_sorted, DEQUANT_SCALES):
-                out_float = out.astype(np.float32) * dequant_scale
-                spatial_dim = int(np.sqrt(out_float.size / CHANNELS))
-                out_hwc = out_float.reshape((spatial_dim, spatial_dim, CHANNELS))
+                spatial_dim = int(np.sqrt(out.size / CHANNELS))
+                out_hwc = out.reshape((spatial_dim, spatial_dim, CHANNELS)).astype(np.float32) * dequant_scale
                 out_chw = out_hwc.transpose(2, 0, 1)
-                out_bchw = np.expand_dims(out_chw, axis=0)
-                formatted_outputs.append(out_bchw)
+                formatted_outputs.append(np.expand_dims(out_chw, axis=0))
 
             # Postprocess
             boxes, scores = postprocess(formatted_outputs)
