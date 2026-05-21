@@ -133,36 +133,46 @@ def preprocess_quantized(img, size=640):
     return img_int8
 
 def slice_feature_map(src_buf, H, W, total_channels):
+    print(f"    [CPU-Accelerated] Running Slice(H={H}, W={W}, Channels={total_channels})...")
+    cpu_start_time = time.perf_counter()
     tensor_3d = np.array(src_buf).reshape((H, W, total_channels))
     half_ch = total_channels // 2
     part1 = tensor_3d[:, :, :half_ch]
     part2 = tensor_3d[:, :, half_ch:]
+    cpu_end_time = time.perf_counter()
+    print(f"    [CPU] Slice Done in {(cpu_end_time - cpu_start_time):.6f} sec")
     return part1.flatten(), part2.flatten()
 
 def concat_feature_maps(buf1, buf2, H, W, ch1, ch2):
+    print(f"    [CPU-Accelerated] Running Concat(H={H}, W={W})...")
+    cpu_start_time = time.perf_counter()
     t1 = np.array(buf1).reshape((H, W, ch1))
     t2 = np.array(buf2).reshape((H, W, ch2))
     t_concat = np.concatenate((t1, t2), axis=2)
+
+    cpu_end_time = time.perf_counter()
+    print(f"    [CPU] Resize Done in {(cpu_end_time - cpu_start_time):.6f} sec")
     return t_concat.flatten()
 
 def resize_nearest_cpu(input_flat, H, W, C, scale=2):
     """
-    Executes Nearest-Neighbor Upsampling on the CPU.
-    Mathematically matches ONNX asymmetric + nearest floor mode.
+    Thực hiện Upsampling theo phương pháp láng giềng gần nhất (Nearest-Neighbor) trên CPU 
+    sử dụng OpenCV được tăng tốc vector hóa.
+    Đảm bảo khớp hoàn toàn về mặt toán học với chế độ asymmetric + nearest floor của ONNX.
     """
-    print(f"    [CPU] Running Resize (Nearest, scale={scale}) (H={H}, W={W}, C={C})...")
+    print(f"    [CPU-Accelerated] Running Resize (Nearest, scale={scale}) (H={H}, W={W}, C={C})...")
     cpu_start_time = time.perf_counter()
 
     x = input_flat.reshape(H, W, C)
 
-    out = np.repeat(x, scale, axis=0)
-    out = np.repeat(out, scale, axis=1)
+    target_size = (W * scale, H * scale)
+    out = cv2.resize(x, target_size, interpolation=cv2.INTER_NEAREST)
 
     cpu_end_time = time.perf_counter()
     print(f"    [CPU] Resize Done in {(cpu_end_time - cpu_start_time):.6f} sec")
 
-    # 3. Flatten and return
     return out.flatten()
+
 def print_tensor_stats(name, tensor):
     """
     Print useful debug statistics for a tensor.
@@ -273,20 +283,20 @@ def cpu_conv2d_layer(
 
     return out_final.flatten()
 def maxpool_2d_cpu(input_flat, H, W, C, K=5, stride=1, pad=2):
-    print(f"    [CPU] Running MaxPool2D (H={H}, W={W}, C={C}, K={K})...")
+    print(f"    [CPU-Accelerated] Running MaxPool2D (H={H}, W={W}, C={C}, K={K})...")
     cpu_start_time = time.perf_counter()
 
     x = input_flat.reshape(H, W, C)
+    kernel = np.ones((K, K), dtype=np.uint8)
 
     if pad > 0:
         x_pad = np.pad(x, ((pad, pad), (pad, pad), (0, 0)), mode='constant', constant_values=-128)
     else:
         x_pad = x
 
-    windows = sliding_window_view(x_pad, (K, K, C))
-    windows = windows[::stride, ::stride, 0, :, :, :]
+    max_mapped = cv2.dilate(x_pad, kernel)
 
-    out = np.max(windows, axis=(2, 3))
+    out = max_mapped[pad:pad+H:stride, pad:pad+W:stride, :]
 
     cpu_end_time = time.perf_counter()
     print(f"    [CPU] MaxPool Done in {(cpu_end_time - cpu_start_time):.6f} sec")
