@@ -309,19 +309,24 @@ def maxpool_2d_cpu(input_flat, H, W, C, K=5, stride=1, pad=2):
 
 class YOLOv8Engine:
 
-    REG_AP_CTRL      = 0x000
+    # AXI Lite register map (based on Vitis HLS s_axilite)
+    REG_AP_CTRL      = 0x000      # ap_start, ap_done, ap_idle, ap_ready
     REG_DESCRIPTOR_0 = 0x010
     REG_DESCRIPTOR_1 = 0x014
     REG_DESCRIPTOR_2 = 0x018
     REG_DESCRIPTOR_3 = 0x01C
-    REG_START_ACCEL  = 0x024
-    REG_BIAS_BASE    = 0x200
+    REG_START_ACCEL  = 0x024      # start_accel argument
+    REG_FMAP_OFFSET  = 0x028      # fmap_offset argument
+    REG_RESIDUAL_OFFSET = 0x02C   # residual_offset argument
+    REG_WEIGHT_OFFSET = 0x030     # weight_offset argument
+    REG_PACKET_OFFSET = 0x034     # packet_offset argument
+    REG_BIAS_BASE    = 0x200      # bias array (256 entries, 32-bit words)
 
     def __init__(self, bitstream_path, target_mhz=None):
         print("Loading Overlay...")
         from pynq import Clocks
         self.overlay = Overlay(bitstream_path)
-        
+
         if target_mhz is not None:
             print(f"Default PL Clock 0: {Clocks.fclk0_mhz:.2f} MHz")
             Clocks.fclk0_mhz = target_mhz
@@ -329,80 +334,38 @@ class YOLOv8Engine:
 
         self.cnn_ip = self.overlay.cnn_accelerator_top_0
 
-        self.dma_pixels = self.overlay.axi_dma_0
-        self.dma_weights = self.overlay.axi_dma_1
-        self.dma_residual = self.overlay.axi_dma_2
-
-        MAX_FMAP_BYTES = 16 * 1024 * 1024  
-        MAX_WEIGHT_BYTES = 8 * 1024 * 1024
+        # No separate DMA IPs – the accelerator accesses memory directly.
+        # We only need CMA buffers for the four AXI master ports.
+        MAX_FMAP_BYTES   = 16 * 1024 * 1024   # 16 MiB
+        MAX_WEIGHT_BYTES = 8 * 1024 * 1024    # 8 MiB
 
         print("Pre-allocating CMA buffers...")
-        self.cma_in_pixels = allocate(shape=(MAX_FMAP_BYTES,), dtype=np.int8)
-        self.cma_out_pixels = allocate(shape=(MAX_FMAP_BYTES,), dtype=np.int8)
-        self.cma_in_weights = allocate(shape=(MAX_WEIGHT_BYTES,), dtype=np.int8)
-        self.cma_in_residual = allocate(shape=(MAX_FMAP_BYTES,), dtype=np.int8)
+        self.cma_in_pixels   = allocate(shape=(MAX_FMAP_BYTES,),   dtype=np.int8)
+        self.cma_in_weights  = allocate(shape=(MAX_WEIGHT_BYTES,), dtype=np.int8)
+        self.cma_in_residual = allocate(shape=(MAX_FMAP_BYTES,),   dtype=np.int8)
+        self.cma_out_pixels  = allocate(shape=(MAX_FMAP_BYTES,),   dtype=np.int8)
 
     # --------------------------------------------------------------------------
-    # DATA PACKING & UNPACKING (Matches tb_top_system.cpp EXACTLY)
+    # Bias writing (unchanged)
     # --------------------------------------------------------------------------
-
-    def _pack_winograd_residual(self, res_3d, current_cout):
-        out_h, out_w, _ = res_3d.shape
-        tiles_x = max(1, out_w // 2)
-        tiles_y = max(1, out_h // 2)
-
-        # Pad to even dimensions if necessary
-        pad_h = (tiles_y * 2) - out_h
-        pad_w = (tiles_x * 2) - out_w
-        if pad_h > 0 or pad_w > 0:
-            res_3d = np.pad(res_3d, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant')
-
-        # Reshape to [tiles_y, 2, tiles_x, 2, current_cout]
-        # Transpose to [tiles_y, tiles_x, current_cout, 2, 2]
-        res_5d = res_3d.reshape(tiles_y, 2, tiles_x, 2, current_cout)
-        return res_5d.transpose(0, 2, 4, 1, 3).flatten()
-
-    def _pack_systolic_residual(self, res_3d, current_cout):
-        out_h, out_w, _ = res_3d.shape
-        sys_tiles = (out_w * out_h + 15) // 16
-        if sys_tiles == 0: sys_tiles = 1
-        cb_blocks = (current_cout + 15) // 16
-
-        # Flatten spatial map: [H*W, current_cout]
-        flat_res = res_3d.reshape(-1, current_cout)
-        
-        # Pad spatial pixels to multiple of 16, and channels to multiple of 16
-        pad_pixels = (sys_tiles * 16) - flat_res.shape[0]
-        pad_channels = (cb_blocks * 16) - current_cout
-        if pad_pixels > 0 or pad_channels > 0:
-            flat_res = np.pad(flat_res, ((0, pad_pixels), (0, pad_channels)), mode='constant')
-
-        # Reshape padded map to [sys_tiles, 16, cb_blocks, 16]
-        res_4d = flat_res.reshape(sys_tiles, 16, cb_blocks, 16)
-        
-        # Transpose to [sys_tiles, cb_blocks, 16_pixels, 16_channels]
-        return res_4d.transpose(0, 2, 1, 3).flatten()
-
-    # --------------------------------------------------------------------------
-    # CONFIGURATION
-    # --------------------------------------------------------------------------
-
     def _write_bias(self, bias_array):
         rem = len(bias_array) % 4
         if rem != 0:
             bias_array = np.pad(bias_array, (0, 4 - rem), mode='constant')
-
         for n in range(len(bias_array) // 4):
             b0 = int(bias_array[4*n]) & 0xFF
-            b1 = int(bias_array[4*n + 1]) & 0xFF
-            b2 = int(bias_array[4*n + 2]) & 0xFF
-            b3 = int(bias_array[4*n + 3]) & 0xFF
+            b1 = int(bias_array[4*n+1]) & 0xFF
+            b2 = int(bias_array[4*n+2]) & 0xFF
+            b3 = int(bias_array[4*n+3]) & 0xFF
             word = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
             self.cnn_ip.write(self.REG_BIAS_BASE + (n * 4), word)
 
-    def _config_cnn_layer(self, _type, w, h, cin, cout, k, stride, pad, has_res, requant, bias_shift):
-        import struct
-        packed_bytes = struct.pack('<BxHHHHBBBBBB', 
+    # --------------------------------------------------------------------------
+    # Layer configuration (unchanged)
+    # --------------------------------------------------------------------------
+    def _config_cnn_layer(self, _type, w, h, cin, cout, k, stride, pad,
+                          has_res, requant, bias_shift):
+        packed_bytes = struct.pack('<BxHHHHBBBBBB',
             _type, w, h, cin, cout, k, stride, pad, has_res, requant, bias_shift
         )
         w0, w1, w2, w3 = struct.unpack('<IIII', packed_bytes)
@@ -412,117 +375,109 @@ class YOLOv8Engine:
         self.cnn_ip.write(self.REG_DESCRIPTOR_3, w3)
 
     # --------------------------------------------------------------------------
-    # LAYER EXECUTION
+    # Layer execution (updated for direct AXI master access)
     # --------------------------------------------------------------------------
-
-    def run_layer(self, layer_name, input_fmap, weights, bias, params, residual_fmap=None, bias_shift=0):
+    def run_layer(self, layer_name, input_fmap, weights, bias, params,
+                  residual_fmap=None, bias_shift=0):
         print(f"\nRunning layer: {layer_name}")
         layer_start_time = time.perf_counter()
         W, H, Cin, Cout, K, stride, requant = params
 
         has_residual = 1 if residual_fmap is not None else 0
 
-        if K == 3 and stride == 1: mode = 0          
-        elif K == 3 and stride == 2: mode = 1        
-        else: mode = 2                               
+        # Determine operation mode: 0=Winograd, 1=Stride2, 2=Systolic
+        if K == 3 and stride == 1:
+            mode = 0
+        elif K == 3 and stride == 2:
+            mode = 1
+        else:
+            mode = 2
 
         out_w = (W + stride - 1) // stride if stride == 2 else W
         out_h = (H + stride - 1) // stride if stride == 2 else H
         pad = 1 if K == 3 else 0
 
-        # Phân mảnh Tiling Cout tối đa dựa trên phần cứng (bội số của 16)
-        max_bram_addr = 8096
-        max_cout_step = max_bram_addr // Cin if mode == 0 else (max_bram_addr // (9 * Cin)) * 16
-        max_cout_step = max(16, (max_cout_step // 16) * 16)
+        # Chunking to respect hardware limitation: C_blocks <= 16 (max 256 Cout)
+        max_cout_step = 256   # hardware supports at most 256 channels per run
         cout_step = min(Cout, max_cout_step)
 
-        # KHỞI TẠO MẢNG ĐẦU RA TUYẾN TÍNH CHUẨN HWC (Không cần biến đổi phụ)
         final_output = np.zeros((out_h, out_w, Cout), dtype=np.int8)
-        
-        # Đảm bảo mảng đầu vào phẳng theo đúng thứ tự tuyến tính không đổi HWC
         input_flat = input_fmap.flatten()
         in_size = input_flat.size
 
         for cout_start in range(0, Cout, cout_step):
             current_cout = min(cout_step, Cout - cout_start)
-            print(f"\nProcessing Cout chunk {cout_start} -> {cout_start + current_cout - 1}")
+            print(f"  Processing Cout {cout_start}..{cout_start+current_cout-1}")
 
-            # Trọng số vẫn được tổ chức tương ứng với lõi tính toán (Không đổi)
-            if mode == 0:
+            # Prepare weights chunk (layout depends on mode)
+            if mode == 0:   # Winograd: weights shape [Cin, Cout, 4, 4]
                 w_4d = weights.reshape((Cin, Cout, 4, 4))
-                weights_chunk = w_4d[:, cout_start : cout_start + current_cout, :, :].flatten()
-            else:
+                weights_chunk = w_4d[:, cout_start:cout_start+current_cout, :, :].flatten()
+            else:           # Systolic: weights packed in blocks of 16
                 total_cout_blocks = (Cout + 15) // 16
                 w_5d = weights.reshape((total_cout_blocks, Cin, K, K, 16))
                 start_block = cout_start // 16
                 num_blocks = (current_cout + 15) // 16
-                weights_chunk = w_5d[start_block : start_block + num_blocks, :, :, :, :].flatten()
+                weights_chunk = w_5d[start_block:start_block+num_blocks, :, :, :, :].flatten()
 
-            bias_chunk = bias[cout_start:cout_start + current_cout]
+            bias_chunk = bias[cout_start:cout_start+current_cout]
 
-            # KÍCH THƯỚC ĐẦU RA KHỚP HOÀN TOÀN VỚI MẢNG TUYẾN TÍNH HWC (Có tính toán phần padding lên bội của 16 của PL)
             padded_current_cout = ((current_cout + 15) // 16) * 16
             out_size = out_h * out_w * padded_current_cout
 
-            # Sao chép trực tiếp không cần Pack dữ liệu
+            # Copy input and weights into CMA buffers (offset 0 for each)
             np.copyto(self.cma_in_pixels[:in_size], input_flat)
             np.copyto(self.cma_in_weights[:len(weights_chunk)], weights_chunk)
 
             if has_residual:
-                # Dữ liệu Residual truyền vào chính là mảng HWC phẳng tuyến tính trích xuất từ phân đoạn kênh tương ứng
                 residual_3d = residual_fmap.reshape(out_h, out_w, Cout)
-                res_slice = residual_3d[:, :, cout_start:cout_start + current_cout]
-                
-                # Bản thân phần cứng PL sẽ tự xử lý Unpack luồng này, Host chỉ việc flatten đưa đi thẳng
+                res_slice = residual_3d[:, :, cout_start:cout_start+current_cout]
                 np.copyto(self.cma_in_residual[:res_slice.size], res_slice.flatten())
 
+            # Flush caches so hardware sees data
             self.cma_in_pixels.flush()
             self.cma_in_weights.flush()
-            if has_residual: self.cma_in_residual.flush()
+            if has_residual:
+                self.cma_in_residual.flush()
 
+            # Write offset registers (always 0 because we copy to start of buffers)
+            self.cnn_ip.write(self.REG_FMAP_OFFSET, 0)
+            self.cnn_ip.write(self.REG_WEIGHT_OFFSET, 0)
+            self.cnn_ip.write(self.REG_RESIDUAL_OFFSET, 0)
+            self.cnn_ip.write(self.REG_PACKET_OFFSET, 0)
+
+            # Configure layer and bias
             self._config_cnn_layer(
-                0, W, H, Cin, current_cout, K, stride, pad, has_residual, requant, bias_shift
+                0, W, H, Cin, current_cout, K, stride, pad,
+                has_residual, requant, bias_shift
             )
             self._write_bias(bias_chunk)
 
-            # --- Kích hoạt Hệ thống Không đồng bộ thông qua DMA ---
+            # Start the accelerator
             self.cnn_ip.write(self.REG_START_ACCEL, 1)
             self.cnn_ip.write(self.REG_AP_CTRL, 1)
 
-            self.dma_pixels.sendchannel.transfer(self.cma_in_pixels[:in_size], wait=False)
-            self.dma_weights.sendchannel.transfer(self.cma_in_weights[:len(weights_chunk)], wait=False)
-            if has_residual:
-                self.dma_residual.sendchannel.transfer(self.cma_in_residual[:res_slice.size], wait=False)
-
-            self.dma_pixels.recvchannel.transfer(self.cma_out_pixels[:out_size], wait=False)
-
-            self.dma_pixels.sendchannel.wait()
-            self.dma_weights.sendchannel.wait()
-            if has_residual: self.dma_residual.sendchannel.wait()
-
-            # Chờ Accelerator tính toán xong
+            # Wait for completion (poll ap_done, bit 1 of REG_AP_CTRL)
             timeout = 10000
             while timeout > 0:
                 ctrl = self.cnn_ip.read(self.REG_AP_CTRL)
-                if (ctrl >> 1) & 0x1: break
+                if (ctrl >> 1) & 0x1:
+                    break
                 timeout -= 1
                 time.sleep(0.001)
-            if timeout == 0: raise RuntimeError("Accelerator timeout!")
+            if timeout == 0:
+                raise RuntimeError("Accelerator timeout!")
 
-            self.dma_pixels.recvchannel.wait()
+            # Invalidate output cache and copy result
             self.cma_out_pixels.invalidate()
-
-            # --- KHÔNG CẦN UNPACK PHỨC TẠP: Dữ liệu đã là HWC tuyến tính chuẩn ---
             raw_output = np.copy(self.cma_out_pixels[:out_size])
-            
-            # Chỉ cần giải phóng vùng đệm padding kênh (nếu kênh hiện tại không chia hết cho 16)
+
+            # Trim padding channels and store into final tensor
             chunk_output = raw_output.reshape(out_h, out_w, padded_current_cout)[:, :, :current_cout]
-            
-            # Gán trực tiếp vào mảng đích
-            final_output[:, :, cout_start:cout_start + current_cout] = chunk_output
+            final_output[:, :, cout_start:cout_start+current_cout] = chunk_output
 
         layer_end_time = time.perf_counter()
-        print(f"Layer {layer_name} completed in {(layer_end_time - layer_start_time):.6f} sec (Zero CPU Remap Overhead)")
+        print(f"Layer {layer_name} completed in {(layer_end_time - layer_start_time):.6f} sec")
         return final_output.flatten()
 
     def clean_up(self):
@@ -530,8 +485,7 @@ class YOLOv8Engine:
         self.cma_out_pixels.freebuffer()
         self.cma_in_weights.freebuffer()
         self.cma_in_residual.freebuffer()
-
-
+        
 # ==============================================================================
 # Graph Runner
 # ==============================================================================
