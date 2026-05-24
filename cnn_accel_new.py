@@ -337,27 +337,25 @@ def run_fused_sppf_cpu(input_flat, H, W, C, K=5):
 # ==============================================================================
 class YOLOv8Engine:
 
-    REG_AP_CTRL                  = 0x000
-    REG_FEATURE_MAP_IN           = 0x010
-    REG_RESIDUAL_IN              = 0x01C
-    REG_WEIGHTS_IN               = 0x028
-    REG_FEATURE_MAP_OUT          = 0x034
-    
-    REG_DESCRIPTOR_0             = 0x040
-    REG_DESCRIPTOR_1             = 0x044
-    REG_DESCRIPTOR_2             = 0x048
-    REG_DESCRIPTOR_3             = 0x04C
-    
-    REG_IN_SIZE_BYTES            = 0x054
-    REG_WEIGHT_SIZE_BYTES        = 0x05C
-    REG_RESIDUAL_SIZE_BYTES      = 0x064
-    REG_OUT_H                    = 0x06C
-    REG_OUT_W                    = 0x074
-    REG_CURRENT_COUT             = 0x07C
-    REG_MODE                     = 0x084
-    REG_TOTAL_PACKETS            = 0x08C
-    REG_START_ACCEL              = 0x094
-    REG_BIAS_BASE                = 0x200
+    # Giao diện điều khiển (s_axi_CTRL)
+    REG_CTRL_AP_CTRL             = 0x00
+    REG_CTRL_DESCRIPTOR_1        = 0x10
+    REG_CTRL_DESCRIPTOR_2        = 0x14
+    REG_CTRL_DESCRIPTOR_3        = 0x18
+    REG_CTRL_DESCRIPTOR_4        = 0x1C
+    REG_CTRL_FMAP_OFFSET         = 0x24
+    REG_CTRL_RESIDUAL_OFFSET     = 0x2C
+    REG_CTRL_WEIGHT_OFFSET       = 0x34
+    REG_CTRL_PACKET_OFFSET       = 0x3C
+    REG_CTRL_BIAS_OFFSET         = 0x44
+    REG_CTRL_START_ACCEL         = 0x4C
+
+    # Giao diện cấp phát con trỏ bộ nhớ (s_axi_control)
+    REG_MEM_FMAP_IN              = 0x10
+    REG_MEM_RESIDUAL_IN          = 0x1C
+    REG_MEM_WEIGHT_IN            = 0x28
+    REG_MEM_DDR_OUT              = 0x34
+    REG_MEM_BIAS_IN              = 0x40
 
     def __init__(self, bitstream_path, target_mhz=None):
         print("Loading Overlay...")
@@ -370,6 +368,10 @@ class YOLOv8Engine:
 
         self.cnn_ip = self.overlay.cnn_accelerator_top_0
         
+        # Vitis HLS sẽ ánh xạ các bundle thành các attribute phân biệt
+        self.ctrl_bus = self.cnn_ip.CTRL if hasattr(self.cnn_ip, 'CTRL') else self.cnn_ip
+        self.mem_bus = self.cnn_ip.control if hasattr(self.cnn_ip, 'control') else self.cnn_ip
+        
         MAX_FMAP_BYTES = 16 * 1024 * 1024  
         MAX_WEIGHT_BYTES = 8 * 1024 * 1024
 
@@ -379,19 +381,21 @@ class YOLOv8Engine:
         self.cma_in_weights = allocate(shape=(MAX_WEIGHT_BYTES,), dtype=np.int8)
         self.cma_in_residual = allocate(shape=(MAX_FMAP_BYTES,), dtype=np.int8)
         
+        # Buffer mới dành riêng cho giao thức Burst Read Bias
+        self.cma_in_bias = allocate(shape=(4096,), dtype=np.int8)
+        
         # --- CACHES FOR EXTREME SPEED ---
         self.weight_cache = {}
         self.bias_cache = {}
         self.config_cache = {}
 
-    def _write_64bit_ptr(self, reg_addr, ptr_val):
-        self.cnn_ip.write(reg_addr, ptr_val & 0xFFFFFFFF)
-        self.cnn_ip.write(reg_addr + 4, (ptr_val >> 32) & 0xFFFFFFFF)
+    def _write_64bit_ptr(self, bus, reg_addr, ptr_val):
+        bus.write(reg_addr, ptr_val & 0xFFFFFFFF)
+        bus.write(reg_addr + 4, (ptr_val >> 32) & 0xFFFFFFFF)
 
     def run_layer(self, layer_name, input_fmap, weights, bias, params, residual_fmap=None, bias_shift=0):
         t_start = time.perf_counter()
 
-        # Profiling accumulators
         input_prep_time = 0.0
         weight_time_total = 0.0
         residual_time_total = 0.0
@@ -419,7 +423,7 @@ class YOLOv8Engine:
         out_h = (H + stride - 1) // stride if stride == 2 else H
         pad = 1 if K == 3 else 0
 
-        max_bram_addr = 8096
+        max_bram_addr = 8192
         if mode == 0:
             max_cout_step = max_bram_addr // Cin
         else:
@@ -478,17 +482,6 @@ class YOLOv8Engine:
 
             np.copyto(self.cma_in_weights[:len(weights_chunk)], weights_chunk)
             self.cma_in_weights[:len(weights_chunk)].flush()
-            
-            if mode == 0:
-                tiles_x = max(1, (out_w + 1) // 2)
-                tiles_y = max(1, (out_h + 1) // 2)
-                total_packets = tiles_x * tiles_y * ((current_cout + 3) // 4)
-            else:
-                sys_tiles = (out_w * out_h + 15) // 16
-                if sys_tiles == 0: sys_tiles = 1
-                cout_blocks = (current_cout + 15) // 16
-                total_packets = sys_tiles * 16 * cout_blocks
-
             out_size = out_h * out_w * padded_current_cout
             weight_time_total += (time.perf_counter() - t0_wt)
 
@@ -499,6 +492,8 @@ class YOLOv8Engine:
                 res_3d = residual_fmap.reshape(out_h, out_w, Cout)[:, :, cout_start:cout_start + current_cout]
                 
                 if mode == 0:
+                    tiles_x = max(1, (out_w + 1) // 2)
+                    tiles_y = max(1, (out_h + 1) // 2)
                     pad_h = (tiles_y * 2) - out_h
                     pad_w = (tiles_x * 2) - out_w
                     if pad_h > 0 or pad_w > 0:
@@ -517,25 +512,29 @@ class YOLOv8Engine:
                 self.cma_in_residual[:residual_size].flush()
             residual_time_total += (time.perf_counter() - t0_res)
 
+            # --- BIAS PREP ---
+            if cache_key not in self.bias_cache:
+                b_arr = bias[cout_start:cout_start + current_cout]
+                self.bias_cache[cache_key] = b_arr.astype(np.int8)
+
+            bias_chunk = self.bias_cache[cache_key]
+            bias_size = len(bias_chunk)
+            np.copyto(self.cma_in_bias[:bias_size], bias_chunk)
+            self.cma_in_bias[:bias_size].flush()
+
             # =====================================================================
             # 3. HARDWARE EXECUTION
             # =====================================================================
             t0_hw = time.perf_counter()
             
-            self._write_64bit_ptr(self.REG_FEATURE_MAP_IN, self.cma_in_pixels.physical_address)
-            self._write_64bit_ptr(self.REG_WEIGHTS_IN, self.cma_in_weights.physical_address)
-            self._write_64bit_ptr(self.REG_RESIDUAL_IN, self.cma_in_residual.physical_address)
-            self._write_64bit_ptr(self.REG_FEATURE_MAP_OUT, self.cma_out_pixels.physical_address)
+            # Khởi tạo con trỏ Memory (s_axi_control)
+            self._write_64bit_ptr(self.mem_bus, self.REG_MEM_FMAP_IN, self.cma_in_pixels.physical_address)
+            self._write_64bit_ptr(self.mem_bus, self.REG_MEM_WEIGHT_IN, self.cma_in_weights.physical_address)
+            self._write_64bit_ptr(self.mem_bus, self.REG_MEM_RESIDUAL_IN, self.cma_in_residual.physical_address)
+            self._write_64bit_ptr(self.mem_bus, self.REG_MEM_DDR_OUT, self.cma_out_pixels.physical_address)
+            self._write_64bit_ptr(self.mem_bus, self.REG_MEM_BIAS_IN, self.cma_in_bias.physical_address)
 
-            self.cnn_ip.write(self.REG_IN_SIZE_BYTES, in_size)
-            self.cnn_ip.write(self.REG_WEIGHT_SIZE_BYTES, len(weights_chunk))
-            self.cnn_ip.write(self.REG_RESIDUAL_SIZE_BYTES, residual_size)
-            self.cnn_ip.write(self.REG_OUT_H, out_h)
-            self.cnn_ip.write(self.REG_OUT_W, out_w)
-            self.cnn_ip.write(self.REG_CURRENT_COUT, current_cout)
-            self.cnn_ip.write(self.REG_MODE, mode)
-            self.cnn_ip.write(self.REG_TOTAL_PACKETS, total_packets)
-
+            # Đóng gói và ghi LayerDescriptor (s_axi_CTRL)
             if cache_key not in self.config_cache:
                 _type = 1 if mode == 3 else 0 
                 packed_bytes = struct.pack('<BxHHHHBBBBBB', _type, W, H, Cin, current_cout, K, stride, pad, has_residual, requant, bias_shift)
@@ -543,28 +542,25 @@ class YOLOv8Engine:
                 self.config_cache[cache_key] = struct.unpack('<IIII', packed_bytes)
 
             w0, w1, w2, w3 = self.config_cache[cache_key]
-            self.cnn_ip.write(self.REG_DESCRIPTOR_0, w0)
-            self.cnn_ip.write(self.REG_DESCRIPTOR_1, w1)
-            self.cnn_ip.write(self.REG_DESCRIPTOR_2, w2)
-            self.cnn_ip.write(self.REG_DESCRIPTOR_3, w3)
+            self.ctrl_bus.write(self.REG_CTRL_DESCRIPTOR_1, w0)
+            self.ctrl_bus.write(self.REG_CTRL_DESCRIPTOR_2, w1)
+            self.ctrl_bus.write(self.REG_CTRL_DESCRIPTOR_3, w2)
+            self.ctrl_bus.write(self.REG_CTRL_DESCRIPTOR_4, w3)
 
-            if cache_key not in self.bias_cache:
-                b_arr = bias[cout_start:cout_start + current_cout]
-                rem = len(b_arr) % 4
-                if rem != 0: b_arr = np.pad(b_arr, (0, 4 - rem), mode='constant')
-                words = []
-                for n in range(len(b_arr) // 4):
-                    words.append((int(b_arr[4*n]) & 0xFF) | ((int(b_arr[4*n + 1]) & 0xFF) << 8) | ((int(b_arr[4*n + 2]) & 0xFF) << 16) | ((int(b_arr[4*n + 3]) & 0xFF) << 24))
-                self.bias_cache[cache_key] = words
-
-            for n, word in enumerate(self.bias_cache[cache_key]):
-                self.cnn_ip.write(self.REG_BIAS_BASE + (n * 4), word)
+            # Đặt Offset bằng 0 do chúng ta sử dụng Base Physical Address
+            self.ctrl_bus.write(self.REG_CTRL_FMAP_OFFSET, 0)
+            self.ctrl_bus.write(self.REG_CTRL_WEIGHT_OFFSET, 0)
+            self.ctrl_bus.write(self.REG_CTRL_RESIDUAL_OFFSET, 0)
+            self.ctrl_bus.write(self.REG_CTRL_PACKET_OFFSET, 0)
+            self.ctrl_bus.write(self.REG_CTRL_BIAS_OFFSET, 0)
             
-            self.cnn_ip.write(self.REG_START_ACCEL, 1)
-            self.cnn_ip.write(self.REG_AP_CTRL, 1)
+            # Gửi Start Tín Hiệu tới Controller & AXI-Lite
+            self.ctrl_bus.write(self.REG_CTRL_START_ACCEL, 1)
+            self.ctrl_bus.write(self.REG_CTRL_AP_CTRL, 1)
 
-            ctrl_reg = self.REG_AP_CTRL
-            while (self.cnn_ip.read(ctrl_reg) & 0x2) == 0:
+            # Đợi AP_DONE
+            ctrl_reg = self.REG_CTRL_AP_CTRL
+            while (self.ctrl_bus.read(ctrl_reg) & 0x2) == 0:
                 pass 
 
             self.cma_out_pixels[:out_size].invalidate()
@@ -595,6 +591,7 @@ class YOLOv8Engine:
         self.cma_out_pixels.freebuffer()
         self.cma_in_weights.freebuffer()
         self.cma_in_residual.freebuffer()
+        self.cma_in_bias.freebuffer()
 # ==============================================================================
 # Graph Runner
 # ==============================================================================
