@@ -82,7 +82,6 @@ def postprocess_optimized(raw_outputs, dequant_scales):
     if len(idx) > 0:
         # 3. Apply Sigmoid, Argmax, and DFL ONLY to passing boxes
         scores = 1 / (1 + np.exp(-np.clip(np.max(all_cls, axis=0)[idx], -88, 88)))
-        class_ids = np.argmax(all_cls[:, idx], axis=0)
         reg = np.concatenate(box_preds, axis=-1)[:, idx].reshape(4, 16, -1)
         
         e_x = np.exp(reg - np.max(reg, axis=1, keepdims=True))
