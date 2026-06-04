@@ -2,7 +2,7 @@ import numpy as np
 import time
 import cv2
 import struct
-from pynq import Overlay, allocate
+from pynq import Overlay, allocate, Clocks
 from numpy.lib.stride_tricks import sliding_window_view
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import socket
@@ -57,79 +57,146 @@ class Logger(object):
         self.log.flush()
 
 def postprocess_optimized(raw_outputs, dequant_scales):
-    # Sort largest to smallest (80x80, 40x40, 20x20) based on size
-    outputs_sorted = sorted(raw_outputs, key=lambda x: x.size, reverse=True)
-    
+
+    outputs_sorted = sorted(
+        raw_outputs,
+        key=lambda x: x.size,
+        reverse=True
+    )
+
     box_preds = []
     cls_preds = []
-    
-    # 1. Extract and format tensors
-    for out, dequant_scale in zip(outputs_sorted, dequant_scales):
-        spatial_dim = int(np.sqrt(out.size / CHANNELS))
-        out_float = out.astype(np.float32) * dequant_scale
-        
-        # Reshape to [H, W, C] -> Transpose to [C, H, W] -> Flatten to [C, H*W]
-        feat = out_float.reshape(spatial_dim, spatial_dim, CHANNELS).transpose(2, 0, 1).reshape(CHANNELS, -1)
-        
-        box_preds.append(feat[:64, :])
-        cls_preds.append(feat[64:, :])
-        
-    all_cls = np.concatenate(cls_preds, axis=-1)
-    
-    # 2. FAST FILTERING: Check un-sigmoidized values against INV_CONF_THRES
-    idx = np.where(np.max(all_cls, axis=0) > INV_CONF_THRES)[0]
-    
-    if len(idx) > 0:
-        # 3. Apply Sigmoid, Argmax, and DFL ONLY to passing boxes
-        scores = 1 / (1 + np.exp(-np.clip(np.max(all_cls, axis=0)[idx], -88, 88)))
-        reg = np.concatenate(box_preds, axis=-1)[:, idx].reshape(4, 16, -1)
-        
-        e_x = np.exp(reg - np.max(reg, axis=1, keepdims=True))
-        dist = np.sum((e_x / np.sum(e_x, axis=1, keepdims=True)) * DFL_W, axis=1).T
-        x1y1 = (ANCHORS[idx] - dist[:, :2]) * STRIDES[idx]
-        x2y2 = (ANCHORS[idx] + dist[:, 2:]) * STRIDES[idx]
-        res_boxes = np.concatenate([x1y1, x2y2], axis=1)
-        
-        # 4. NMS Formatting
-        widths = res_boxes[:, 2] - res_boxes[:, 0]
-        heights = res_boxes[:, 3] - res_boxes[:, 1]
-        cv_boxes = np.column_stack((res_boxes[:, 0], res_boxes[:, 1], widths, heights)).tolist()
-        cv_scores = scores.tolist()
-        
-        nms_idx = cv2.dnn.NMSBoxes(cv_boxes, cv_scores, CONF_THRES, IOU_THRES)
 
-        if len(nms_idx) > 0:
-            keep = nms_idx.flatten()
-            return res_boxes[keep], scores[keep]
-            
-    return np.array([]), np.array([])
+    # --------------------------------------
+    # Extract predictions
+    # --------------------------------------
+    for out, dequant_scale in zip(outputs_sorted, dequant_scales):
+
+        spatial_dim = int(
+            np.sqrt(out.size / CHANNELS)
+        )
+
+        out_float = out.astype(np.float32) * dequant_scale
+
+        feat = (
+            out_float
+            .reshape(spatial_dim, spatial_dim, CHANNELS)
+            .transpose(2, 0, 1)
+            .reshape(CHANNELS, -1)
+        )
+
+        box_preds.append(feat[:64])
+        cls_preds.append(feat[64:])
+
+    all_cls = np.concatenate(cls_preds, axis=-1)
+
+    # --------------------------------------
+    # Fast confidence filtering
+    # --------------------------------------
+    max_logits = np.max(all_cls, axis=0)
+
+    idx = np.where(
+        max_logits > INV_CONF_THRES
+    )[0]
+
+    if len(idx) == 0:
+        return np.array([]), np.array([])
+
+    # --------------------------------------
+    # Scores
+    # --------------------------------------
+    scores = 1.0 / (
+        1.0 + np.exp(
+            -np.clip(max_logits[idx], -88, 88)
+        )
+    )
+
+    # --------------------------------------
+    # DFL decode
+    # --------------------------------------
+    reg = (
+        np.concatenate(box_preds, axis=-1)[:, idx]
+        .reshape(4, 16, -1)
+    )
+
+    reg = reg - np.max(
+        reg,
+        axis=1,
+        keepdims=True
+    )
+
+    exp_reg = np.exp(reg)
+
+    # 1. Calculate sum for softmax
+    sum_exp = np.sum(exp_reg, axis=1, keepdims=True)
+    
+    # 2. In-place division saves creating a new array in RAM
+    exp_reg /= sum_exp
+    
+    # 3. Multiply by weights and sum
+    dist = np.sum(exp_reg * DFL_W, axis=1).T
+
+    x1y1 = (
+        ANCHORS[idx]
+        - dist[:, :2]
+    ) * STRIDES[idx]
+
+    x2y2 = (
+        ANCHORS[idx]
+        + dist[:, 2:]
+    ) * STRIDES[idx]
+
+    boxes = np.concatenate(
+        [x1y1, x2y2],
+        axis=1
+    )
+
+    # --------------------------------------
+    # NMS
+    # --------------------------------------
+    widths = boxes[:, 2] - boxes[:, 0]
+    heights = boxes[:, 3] - boxes[:, 1]
+
+    cv_boxes = np.column_stack(
+        (
+            boxes[:, 0],
+            boxes[:, 1],
+            widths,
+            heights
+        )
+    ).tolist()
+
+    nms_idx = cv2.dnn.NMSBoxes(
+        cv_boxes,
+        scores.tolist(),
+        CONF_THRES,
+        IOU_THRES
+    )
+
+    if len(nms_idx) == 0:
+        return np.array([]), np.array([])
+
+    keep = nms_idx.flatten()
+
+    return boxes[keep], scores[keep]
 
 def preprocess_quantized(img, size=640):
     h, w = img.shape[:2]
-
-    # 1. Convert BGR to RGB
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    # 2. Calculate scale and resize while KEEPING aspect ratio
+    # 1. Calculate scale and resize
     scale = min(size / h, size / w)
     nh, nw = int(h * scale), int(w * scale)
-    resized = cv2.resize(img, (nw, nh))
+    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-    # 3. Create a black square canvas and paste image in top-left
-    canvas = np.zeros((size, size, 3), dtype=np.uint8)
-    canvas[:nh, :nw] = resized
+    # 2. Use C-optimized cv2.copyMakeBorder instead of NumPy slicing
+    canvas = cv2.copyMakeBorder(resized, 0, size - nh, 0, size - nw, cv2.BORDER_CONSTANT, value=(0,0,0))
 
-    # 4. Quantize to INT8
-    y_scale = 0.015625
-    y_zero_point = 0
-
-    img_normalized = canvas.astype(np.float32) / 255.0
-    img_quantized = np.round(img_normalized / y_scale) + y_zero_point
+    # 3. Fused Math: (img / 255.0) / 0.015625 is exactly the same as img * (64.0 / 255.0)
+    img_quantized = np.round(canvas.astype(np.float32) * (64.0 / 255.0))
     
-    img_int8 = np.clip(img_quantized, -128, 127).astype(np.int8)
+    return np.clip(img_quantized, -128, 127).astype(np.int8)
 
-    # Return the image exactly as [H, W, C] (Shape: 640, 640, 3)
-    return img_int8
 
 def slice_feature_map(src_buf, H, W, total_channels):
     cpu_start_time = time.perf_counter()
@@ -361,7 +428,6 @@ class YOLOv8Engine:
 
     def __init__(self, bitstream_path, target_mhz=None):
         print("Loading Overlay...")
-        from pynq import Clocks
         self.overlay = Overlay(bitstream_path)
         
         if target_mhz is not None:
