@@ -11,12 +11,26 @@ import sys
 # ==============================================================================
 # YOLO Post-Processing Constants 
 # ==============================================================================
-REG_MAX = 16
-STRIDES = [8, 16, 32]
 CONF_THRES = 0.25
 IOU_THRES = 0.7
 CHANNELS = 65
 DEQUANT_SCALES = [0.25, 0.25, 0.25]
+
+# 1. Pre-calculate Inverse Sigmoid Threshold (Saves CPU time filtering empty pixels)
+INV_CONF_THRES = np.log(CONF_THRES / (1.0 - CONF_THRES))
+
+# 2. Pre-calculate Anchors and Strides ONCE
+anchors_list, strides_list = [], []
+for s, f in zip([8, 16, 32], [80, 40, 20]):
+    sx, sy = np.meshgrid(np.arange(f) + 0.5, np.arange(f) + 0.5)
+    anchors_list.append(np.stack((sx, sy), -1).reshape(-1, 2))
+    strides_list.append(np.full((f*f, 1), s))
+ANCHORS = np.concatenate(anchors_list)
+STRIDES = np.concatenate(strides_list)
+
+# 3. Pre-calculate DFL weights
+DFL_W = np.arange(16, dtype=np.float32).reshape(1, 16, 1)
+
 # ==============================================================================
 # HLS Constants 
 # ==============================================================================
@@ -41,69 +55,56 @@ class Logger(object):
     def flush(self):
         self.terminal.flush()
         self.log.flush()
-def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
 
-def dfl_decode(bbox):
-    B, C, H, W = bbox.shape
-    bbox = bbox.reshape(B, 4, REG_MAX, H, W)
-    bbox = np.exp(bbox - bbox.max(axis=2, keepdims=True))
-    bbox = bbox / bbox.sum(axis=2, keepdims=True)
-    proj = np.arange(REG_MAX, dtype=np.float32)
-    bbox = (bbox * proj.reshape(1,1,REG_MAX,1,1)).sum(axis=2)
-    return bbox
-
-def make_grid(H, W):
-    y, x = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
-    return x, y
-
-def decode_scale(output, stride):
-    B, C, H, W = output.shape
-    bbox = output[:, :64, :, :]
-    cls  = output[:, 64:, :, :]
-    bbox = dfl_decode(bbox)
-    grid_x, grid_y = make_grid(H, W)
-    grid_x = grid_x.reshape(1, 1, H, W)
-    grid_y = grid_y.reshape(1, 1, H, W)
-    l = bbox[:, 0]
-    t = bbox[:, 1]
-    r = bbox[:, 2]
-    b = bbox[:, 3]
-    x1 = (grid_x - l) * stride
-    y1 = (grid_y - t) * stride
-    x2 = (grid_x + r) * stride
-    y2 = (grid_y + b) * stride
-    boxes = np.stack([x1, y1, x2, y2], axis=-1)
-    scores = sigmoid(cls)
-    return boxes.reshape(-1,4), scores.reshape(-1)
-
-def postprocess(outputs, debug_mode=False):
-    all_boxes, all_scores = [], []
-    for out, stride in zip(outputs, STRIDES):
-        boxes, scores = decode_scale(out, stride)
-        mask = scores > CONF_THRES
-        all_boxes.append(boxes[mask])
-        all_scores.append(scores[mask])
-
-    if len(all_boxes) == 0 or len(np.concatenate(all_boxes)) == 0:
-        return np.array([]), np.array([])
-
-    boxes = np.concatenate(all_boxes, axis=0)
-    scores = np.concatenate(all_scores, axis=0)
+def postprocess_optimized(raw_outputs, dequant_scales):
+    # Sort largest to smallest (80x80, 40x40, 20x20) based on size
+    outputs_sorted = sorted(raw_outputs, key=lambda x: x.size, reverse=True)
     
-    if debug_mode: return boxes, scores 
+    box_preds = []
+    cls_preds = []
+    
+    # 1. Extract and format tensors
+    for out, dequant_scale in zip(outputs_sorted, dequant_scales):
+        spatial_dim = int(np.sqrt(out.size / CHANNELS))
+        out_float = out.astype(np.float32) * dequant_scale
+        
+        # Reshape to [H, W, C] -> Transpose to [C, H, W] -> Flatten to [C, H*W]
+        feat = out_float.reshape(spatial_dim, spatial_dim, CHANNELS).transpose(2, 0, 1).reshape(CHANNELS, -1)
+        
+        box_preds.append(feat[:64, :])
+        cls_preds.append(feat[64:, :])
+        
+    all_cls = np.concatenate(cls_preds, axis=-1)
+    
+    # 2. FAST FILTERING: Check un-sigmoidized values against INV_CONF_THRES
+    idx = np.where(np.max(all_cls, axis=0) > INV_CONF_THRES)[0]
+    
+    if len(idx) > 0:
+        # 3. Apply Sigmoid, Argmax, and DFL ONLY to passing boxes
+        scores = 1 / (1 + np.exp(-np.clip(np.max(all_cls, axis=0)[idx], -88, 88)))
+        class_ids = np.argmax(all_cls[:, idx], axis=0)
+        reg = np.concatenate(box_preds, axis=-1)[:, idx].reshape(4, 16, -1)
+        
+        e_x = np.exp(reg - np.max(reg, axis=1, keepdims=True))
+        dist = np.sum((e_x / np.sum(e_x, axis=1, keepdims=True)) * DFL_W, axis=1).T
+        x1y1 = (ANCHORS[idx] - dist[:, :2]) * STRIDES[idx]
+        x2y2 = (ANCHORS[idx] + dist[:, 2:]) * STRIDES[idx]
+        res_boxes = np.concatenate([x1y1, x2y2], axis=1)
+        
+        # 4. NMS Formatting
+        widths = res_boxes[:, 2] - res_boxes[:, 0]
+        heights = res_boxes[:, 3] - res_boxes[:, 1]
+        cv_boxes = np.column_stack((res_boxes[:, 0], res_boxes[:, 1], widths, heights)).tolist()
+        cv_scores = scores.tolist()
+        
+        nms_idx = cv2.dnn.NMSBoxes(cv_boxes, cv_scores, CONF_THRES, IOU_THRES)
 
-    widths = boxes[:, 2] - boxes[:, 0]
-    heights = boxes[:, 3] - boxes[:, 1]
-    cv_boxes = np.column_stack((boxes[:, 0], boxes[:, 1], widths, heights)).tolist()
-    cv_scores = scores.tolist()
+        if len(nms_idx) > 0:
+            keep = nms_idx.flatten()
+            return res_boxes[keep], scores[keep]
+            
+    return np.array([]), np.array([])
 
-    indices = cv2.dnn.NMSBoxes(cv_boxes, cv_scores, CONF_THRES, IOU_THRES)
-    if len(indices) > 0:
-        keep = indices.flatten()
-        return boxes[keep], scores[keep]
-    else:
-        return np.array([]), np.array([])
 def preprocess_quantized(img, size=640):
     h, w = img.shape[:2]
 
@@ -337,25 +338,27 @@ def run_fused_sppf_cpu(input_flat, H, W, C, K=5):
 # ==============================================================================
 class YOLOv8Engine:
 
-    # Giao diện điều khiển (s_axi_CTRL)
-    REG_CTRL_AP_CTRL             = 0x00
-    REG_CTRL_DESCRIPTOR_1        = 0x10
-    REG_CTRL_DESCRIPTOR_2        = 0x14
-    REG_CTRL_DESCRIPTOR_3        = 0x18
-    REG_CTRL_DESCRIPTOR_4        = 0x1C
-    REG_CTRL_FMAP_OFFSET         = 0x24
-    REG_CTRL_RESIDUAL_OFFSET     = 0x2C
-    REG_CTRL_WEIGHT_OFFSET       = 0x34
-    REG_CTRL_PACKET_OFFSET       = 0x3C
-    REG_CTRL_BIAS_OFFSET         = 0x44
-    REG_CTRL_START_ACCEL         = 0x4C
-
-    # Giao diện cấp phát con trỏ bộ nhớ (s_axi_control)
-    REG_MEM_FMAP_IN              = 0x10
-    REG_MEM_RESIDUAL_IN          = 0x1C
-    REG_MEM_WEIGHT_IN            = 0x28
-    REG_MEM_DDR_OUT              = 0x34
-    REG_MEM_BIAS_IN              = 0x40
+    REG_AP_CTRL                  = 0x000
+    REG_FEATURE_MAP_IN           = 0x010
+    REG_RESIDUAL_IN              = 0x01C
+    REG_WEIGHTS_IN               = 0x028
+    REG_FEATURE_MAP_OUT          = 0x034
+    
+    REG_DESCRIPTOR_0             = 0x040
+    REG_DESCRIPTOR_1             = 0x044
+    REG_DESCRIPTOR_2             = 0x048
+    REG_DESCRIPTOR_3             = 0x04C
+    
+    REG_IN_SIZE_BYTES            = 0x054
+    REG_WEIGHT_SIZE_BYTES        = 0x05C
+    REG_RESIDUAL_SIZE_BYTES      = 0x064
+    REG_OUT_H                    = 0x06C
+    REG_OUT_W                    = 0x074
+    REG_CURRENT_COUT             = 0x07C
+    REG_MODE                     = 0x084
+    REG_TOTAL_PACKETS            = 0x08C
+    REG_START_ACCEL              = 0x094
+    REG_BIAS_BASE                = 0x200
 
     def __init__(self, bitstream_path, target_mhz=None):
         print("Loading Overlay...")
@@ -368,30 +371,25 @@ class YOLOv8Engine:
 
         self.cnn_ip = self.overlay.cnn_accelerator_top_0
         
-        # Vitis HLS sẽ ánh xạ các bundle thành các attribute phân biệt
-        self.ctrl_bus = self.cnn_ip.CTRL if hasattr(self.cnn_ip, 'CTRL') else self.cnn_ip
-        self.mem_bus = self.cnn_ip.control if hasattr(self.cnn_ip, 'control') else self.cnn_ip
-        
         MAX_FMAP_BYTES = 16 * 1024 * 1024  
         MAX_WEIGHT_BYTES = 8 * 1024 * 1024
 
-        print("Pre-allocating CMA buffers...")
-        self.cma_in_pixels = allocate(shape=(MAX_FMAP_BYTES,), dtype=np.int8)
-        self.cma_out_pixels = allocate(shape=(MAX_FMAP_BYTES,), dtype=np.int8)
-        self.cma_in_weights = allocate(shape=(MAX_WEIGHT_BYTES,), dtype=np.int8)
-        self.cma_in_residual = allocate(shape=(MAX_FMAP_BYTES,), dtype=np.int8)
+        print("Pre-allocating Uncached CMA buffers...")
+        self.cma_in_pixels = allocate(shape=(MAX_FMAP_BYTES,), dtype=np.int8, cacheable=False)
+        self.cma_out_pixels = allocate(shape=(MAX_FMAP_BYTES,), dtype=np.int8, cacheable=False)
+        self.cma_in_weights = allocate(shape=(MAX_WEIGHT_BYTES,), dtype=np.int8, cacheable=False)
+        self.cma_in_residual = allocate(shape=(MAX_FMAP_BYTES,), dtype=np.int8, cacheable=False)
         
-        # Buffer mới dành riêng cho giao thức Burst Read Bias
-        self.cma_in_bias = allocate(shape=(4096,), dtype=np.int8)
-        
-        # --- CACHES FOR EXTREME SPEED ---
+        # PRE-ALLOCATED BUFFER TO ELIMINATE THE 28ms INPUT PREP DELAY
+        self.pad_buffer_3ch = np.zeros((640, 640, 16), dtype=np.int8)
+
         self.weight_cache = {}
         self.bias_cache = {}
         self.config_cache = {}
 
-    def _write_64bit_ptr(self, bus, reg_addr, ptr_val):
-        bus.write(reg_addr, ptr_val & 0xFFFFFFFF)
-        bus.write(reg_addr + 4, (ptr_val >> 32) & 0xFFFFFFFF)
+    def _write_64bit_ptr(self, reg_addr, ptr_val):
+        self.cnn_ip.write(reg_addr, ptr_val & 0xFFFFFFFF)
+        self.cnn_ip.write(reg_addr + 4, (ptr_val >> 32) & 0xFFFFFFFF)
 
     def run_layer(self, layer_name, input_fmap, weights, bias, params, residual_fmap=None, bias_shift=0):
         t_start = time.perf_counter()
@@ -399,18 +397,25 @@ class YOLOv8Engine:
         input_prep_time = 0.0
         weight_time_total = 0.0
         residual_time_total = 0.0
-        hw_time_total = 0.0
+        mmio_setup_time = 0.0
+        pure_hw_time = 0.0
         unpack_time_total = 0.0
 
         def print_profiling():
             total_time = time.perf_counter() - t_start
-            print(f"\n[{layer_name}] Profiling:")
-            print(f"  Input Prep     : {input_prep_time*1000:.3f} ms")
-            print(f"  Weight Process : {weight_time_total*1000:.3f} ms")
-            print(f"  Residual Pack  : {residual_time_total*1000:.3f} ms")
-            print(f"  HW Execution   : {hw_time_total*1000:.3f} ms")
-            print(f"  Output Unpack  : {unpack_time_total*1000:.3f} ms")
-            print(f"  TOTAL          : {total_time*1000:.3f} ms\n")
+            if "run_times" not in self.__dict__: self.run_times = {}
+            if layer_name not in self.run_times: self.run_times[layer_name] = 0
+            
+            if self.run_times[layer_name] < 2:
+                print(f"\n[{layer_name}] Profiling:")
+                print(f"  Input Prep     : {input_prep_time*1000:.3f} ms")
+                print(f"  Weight Process : {weight_time_total*1000:.3f} ms")
+                print(f"  Residual Pack  : {residual_time_total*1000:.3f} ms")
+                print(f"  MMIO Setup     : {mmio_setup_time*1000:.3f} ms")
+                print(f"  Pure HW Math   : {pure_hw_time*1000:.3f} ms")
+                print(f"  Output Unpack  : {unpack_time_total*1000:.3f} ms")
+                print(f"  TOTAL          : {total_time*1000:.3f} ms\n")
+            self.run_times[layer_name] += 1
         
         W, H, Cin, Cout, K, stride, requant = params
         has_residual = 1 if residual_fmap is not None else 0
@@ -423,7 +428,7 @@ class YOLOv8Engine:
         out_h = (H + stride - 1) // stride if stride == 2 else H
         pad = 1 if K == 3 else 0
 
-        max_bram_addr = 8192
+        max_bram_addr = 8096
         if mode == 0:
             max_cout_step = max_bram_addr // Cin
         else:
@@ -435,19 +440,18 @@ class YOLOv8Engine:
         cout_step = min(Cout, max_cout_step)
 
         # =====================================================================
-        # 1. INPUT FEATURE MAP 
+        # 1. FAST INPUT PREP (Using pre-allocated padding buffer)
         # =====================================================================
         t0_in = time.perf_counter()
         
         if Cin == 3:
-            padded = np.pad(input_fmap.reshape(H, W, 3), ((0,0), (0,0), (0, 13)), mode='constant')
+            # Memory mapping into pre-allocated buffer is instant
+            self.pad_buffer_3ch[:H, :W, :3] = input_fmap.reshape(H, W, 3)
             in_size = W * H * 16
-            np.copyto(self.cma_in_pixels[:in_size], padded.ravel())
+            np.copyto(self.cma_in_pixels[:in_size], self.pad_buffer_3ch[:H, :W, :].ravel())
         else:
             in_size = W * H * Cin
             np.copyto(self.cma_in_pixels[:in_size], input_fmap) 
-            
-        self.cma_in_pixels[:in_size].flush()
 
         needs_chunking = cout_step < Cout
         if needs_chunking:
@@ -455,15 +459,12 @@ class YOLOv8Engine:
 
         input_prep_time = time.perf_counter() - t0_in
 
-        # =====================================================================
-        # 2. CHUNK PROCESSING LOOP
-        # =====================================================================
         for cout_start in range(0, Cout, cout_step):
             current_cout = min(cout_step, Cout - cout_start)
             padded_current_cout = ((current_cout + 15) // 16) * 16
             cache_key = f"{layer_name}_{cout_start}"
 
-            # --- WEIGHTS PREP ---
+            # --- FAST WEIGHT PREP ---
             t0_wt = time.perf_counter()
             if cache_key in self.weight_cache:
                 weights_chunk = self.weight_cache[cache_key]
@@ -481,26 +482,32 @@ class YOLOv8Engine:
                 self.weight_cache[cache_key] = weights_chunk
 
             np.copyto(self.cma_in_weights[:len(weights_chunk)], weights_chunk)
-            self.cma_in_weights[:len(weights_chunk)].flush()
+            
+            if mode == 0:
+                tiles_x = max(1, (out_w + 1) // 2)
+                tiles_y = max(1, (out_h + 1) // 2)
+                total_packets = tiles_x * tiles_y * ((current_cout + 3) // 4)
+            else:
+                sys_tiles = (out_w * out_h + 15) // 16
+                if sys_tiles == 0: sys_tiles = 1
+                cout_blocks = (current_cout + 15) // 16
+                total_packets = sys_tiles * 16 * cout_blocks
+
             out_size = out_h * out_w * padded_current_cout
             weight_time_total += (time.perf_counter() - t0_wt)
 
-            # --- RESIDUAL PREP ---
+            # --- FAST RESIDUAL PREP ---
             t0_res = time.perf_counter()
             residual_size = 0
             if has_residual:
                 res_3d = residual_fmap.reshape(out_h, out_w, Cout)[:, :, cout_start:cout_start + current_cout]
-                
                 if mode == 0:
-                    tiles_x = max(1, (out_w + 1) // 2)
-                    tiles_y = max(1, (out_h + 1) // 2)
                     pad_h = (tiles_y * 2) - out_h
                     pad_w = (tiles_x * 2) - out_w
                     if pad_h > 0 or pad_w > 0:
                         res_3d = np.pad(res_3d, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant')
                     if padded_current_cout > current_cout:
                         res_3d = np.pad(res_3d, ((0, 0), (0, 0), (0, padded_current_cout - current_cout)), mode='constant')
-                    
                     res_chunk = res_3d.reshape(tiles_y, 2, tiles_x, 2, padded_current_cout).transpose(0, 2, 1, 3, 4).flatten()
                 else:
                     if padded_current_cout > current_cout:
@@ -509,32 +516,28 @@ class YOLOv8Engine:
 
                 residual_size = len(res_chunk)
                 np.copyto(self.cma_in_residual[:residual_size], res_chunk)
-                self.cma_in_residual[:residual_size].flush()
+
             residual_time_total += (time.perf_counter() - t0_res)
 
-            # --- BIAS PREP ---
-            if cache_key not in self.bias_cache:
-                b_arr = bias[cout_start:cout_start + current_cout]
-                self.bias_cache[cache_key] = b_arr.astype(np.int8)
-
-            bias_chunk = self.bias_cache[cache_key]
-            bias_size = len(bias_chunk)
-            np.copyto(self.cma_in_bias[:bias_size], bias_chunk)
-            self.cma_in_bias[:bias_size].flush()
-
             # =====================================================================
-            # 3. HARDWARE EXECUTION
+            # 3. MMIO SETUP TIME
             # =====================================================================
-            t0_hw = time.perf_counter()
+            t0_mmio = time.perf_counter()
             
-            # Khởi tạo con trỏ Memory (s_axi_control)
-            self._write_64bit_ptr(self.mem_bus, self.REG_MEM_FMAP_IN, self.cma_in_pixels.physical_address)
-            self._write_64bit_ptr(self.mem_bus, self.REG_MEM_WEIGHT_IN, self.cma_in_weights.physical_address)
-            self._write_64bit_ptr(self.mem_bus, self.REG_MEM_RESIDUAL_IN, self.cma_in_residual.physical_address)
-            self._write_64bit_ptr(self.mem_bus, self.REG_MEM_DDR_OUT, self.cma_out_pixels.physical_address)
-            self._write_64bit_ptr(self.mem_bus, self.REG_MEM_BIAS_IN, self.cma_in_bias.physical_address)
+            self._write_64bit_ptr(self.REG_FEATURE_MAP_IN, self.cma_in_pixels.physical_address)
+            self._write_64bit_ptr(self.REG_WEIGHTS_IN, self.cma_in_weights.physical_address)
+            self._write_64bit_ptr(self.REG_RESIDUAL_IN, self.cma_in_residual.physical_address)
+            self._write_64bit_ptr(self.REG_FEATURE_MAP_OUT, self.cma_out_pixels.physical_address)
 
-            # Đóng gói và ghi LayerDescriptor (s_axi_CTRL)
+            self.cnn_ip.write(self.REG_IN_SIZE_BYTES, in_size)
+            self.cnn_ip.write(self.REG_WEIGHT_SIZE_BYTES, len(weights_chunk))
+            self.cnn_ip.write(self.REG_RESIDUAL_SIZE_BYTES, residual_size)
+            self.cnn_ip.write(self.REG_OUT_H, out_h)
+            self.cnn_ip.write(self.REG_OUT_W, out_w)
+            self.cnn_ip.write(self.REG_CURRENT_COUT, current_cout)
+            self.cnn_ip.write(self.REG_MODE, mode)
+            self.cnn_ip.write(self.REG_TOTAL_PACKETS, total_packets)
+
             if cache_key not in self.config_cache:
                 _type = 1 if mode == 3 else 0 
                 packed_bytes = struct.pack('<BxHHHHBBBBBB', _type, W, H, Cin, current_cout, K, stride, pad, has_residual, requant, bias_shift)
@@ -542,32 +545,39 @@ class YOLOv8Engine:
                 self.config_cache[cache_key] = struct.unpack('<IIII', packed_bytes)
 
             w0, w1, w2, w3 = self.config_cache[cache_key]
-            self.ctrl_bus.write(self.REG_CTRL_DESCRIPTOR_1, w0)
-            self.ctrl_bus.write(self.REG_CTRL_DESCRIPTOR_2, w1)
-            self.ctrl_bus.write(self.REG_CTRL_DESCRIPTOR_3, w2)
-            self.ctrl_bus.write(self.REG_CTRL_DESCRIPTOR_4, w3)
+            self.cnn_ip.write(self.REG_DESCRIPTOR_0, w0)
+            self.cnn_ip.write(self.REG_DESCRIPTOR_1, w1)
+            self.cnn_ip.write(self.REG_DESCRIPTOR_2, w2)
+            self.cnn_ip.write(self.REG_DESCRIPTOR_3, w3)
 
-            # Đặt Offset bằng 0 do chúng ta sử dụng Base Physical Address
-            self.ctrl_bus.write(self.REG_CTRL_FMAP_OFFSET, 0)
-            self.ctrl_bus.write(self.REG_CTRL_WEIGHT_OFFSET, 0)
-            self.ctrl_bus.write(self.REG_CTRL_RESIDUAL_OFFSET, 0)
-            self.ctrl_bus.write(self.REG_CTRL_PACKET_OFFSET, 0)
-            self.ctrl_bus.write(self.REG_CTRL_BIAS_OFFSET, 0)
+            if cache_key not in self.bias_cache:
+                b_arr = bias[cout_start:cout_start + current_cout]
+                rem = len(b_arr) % 4
+                if rem != 0: b_arr = np.pad(b_arr, (0, 4 - rem), mode='constant')
+                words = []
+                for n in range(len(b_arr) // 4):
+                    words.append((int(b_arr[4*n]) & 0xFF) | ((int(b_arr[4*n + 1]) & 0xFF) << 8) | ((int(b_arr[4*n + 2]) & 0xFF) << 16) | ((int(b_arr[4*n + 3]) & 0xFF) << 24))
+                self.bias_cache[cache_key] = words
+
+            for n, word in enumerate(self.bias_cache[cache_key]):
+                self.cnn_ip.write(self.REG_BIAS_BASE + (n * 4), word)
             
-            # Gửi Start Tín Hiệu tới Controller & AXI-Lite
-            self.ctrl_bus.write(self.REG_CTRL_START_ACCEL, 1)
-            self.ctrl_bus.write(self.REG_CTRL_AP_CTRL, 1)
-
-            # Đợi AP_DONE
-            ctrl_reg = self.REG_CTRL_AP_CTRL
-            while (self.ctrl_bus.read(ctrl_reg) & 0x2) == 0:
-                pass 
-
-            self.cma_out_pixels[:out_size].invalidate()
-            hw_time_total += (time.perf_counter() - t0_hw)
+            mmio_setup_time += (time.perf_counter() - t0_mmio)
 
             # =====================================================================
-            # 4. FAST OUTPUT UNPACKING
+            # 4. PURE HW EXECUTION TIME
+            # =====================================================================
+            t0_hw = time.perf_counter()
+            self.cnn_ip.write(self.REG_START_ACCEL, 1)
+            self.cnn_ip.write(self.REG_AP_CTRL, 1)
+
+            ctrl_reg = self.REG_AP_CTRL
+            while (self.cnn_ip.read(ctrl_reg) & 0x2) == 0:
+                pass 
+            pure_hw_time += (time.perf_counter() - t0_hw)
+
+            # =====================================================================
+            # 5. FAST OUTPUT UNPACKING
             # =====================================================================
             t0_unpack = time.perf_counter()
             raw_out_3d = self.cma_out_pixels[:out_size].reshape(out_h, out_w, padded_current_cout)
@@ -591,7 +601,6 @@ class YOLOv8Engine:
         self.cma_out_pixels.freebuffer()
         self.cma_in_weights.freebuffer()
         self.cma_in_residual.freebuffer()
-        self.cma_in_bias.freebuffer()
 # ==============================================================================
 # Graph Runner
 # ==============================================================================
@@ -2254,27 +2263,15 @@ if __name__ == "__main__":
         print(f"\n[INFO] Inference alone took: {inf_end - inf_start:.4f} sec")
 
         try:
-            # Grab outputs directly from memory
+            # Grab outputs directly from memory (flat int8 arrays)
             raw_outputs = [
                 graph_runner.tensor_store["1323"],
                 graph_runner.tensor_store["1436"],
                 graph_runner.tensor_store["1549"]
             ]
             
-            # Sort (largest to smallest) and format
-            outputs_sorted = sorted(raw_outputs, key=lambda x: x.size, reverse=True)
-            formatted_outputs = []
-            
-            for out, dequant_scale in zip(outputs_sorted, DEQUANT_SCALES):
-                out_float = out.astype(np.float32) * dequant_scale
-                spatial_dim = int(np.sqrt(out_float.size / CHANNELS))
-                out_hwc = out_float.reshape((spatial_dim, spatial_dim, CHANNELS))
-                out_chw = out_hwc.transpose(2, 0, 1)
-                out_bchw = np.expand_dims(out_chw, axis=0)
-                formatted_outputs.append(out_bchw)
-
-            # Postprocess
-            boxes, scores = postprocess(formatted_outputs)
+            # Postprocess using the new optimized function
+            boxes, scores = postprocess_optimized(raw_outputs, DEQUANT_SCALES)
             num_boxes = len(boxes)
             print(f"Total boxes detected: {num_boxes}")
 
